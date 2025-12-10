@@ -1,186 +1,138 @@
-**SARS-CoV-2 Infection Dynamics Analysis**
+**SARS-CoV-2 Infection Dynamics - Single-Cell RNA-seq Analysis**
 
-**Project Overview**
+**Reference:** Ravindra _et al._, _PLOS Biology_ (2021) - _Single-cell longitudinal analysis of SARS-CoV-2 infection in human airway epithelium_  
+<https://doi.org/10.1371/journal.pbio.3001143>
 
-This project reproduces the trajectory analysis of SARS-CoV-2-infected human bronchial epithelial cells using single-cell RNA-seq (scRNA-seq) data. The analysis follows the workflow in the study: [PLOS Biology, 2020](https://journals.plos.org/plosbiology/article?id=10.1371%2Fjournal.pbio.3001143&utm_source=chatgpt.com).
+**Data:** GEO GSE166766 (10x mtx/tsv)  
+<https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE166766>
 
-We focus on:
+**🎯 Project Objective**
 
-- Neighborhood clustering
-- Cell type identification
-- Pseudotime ordering of differentiation
-- Marker gene analysis (ACE2 and ENO2)
+Reproduce **neighborhood clustering**, **cell-type annotation**, and **trajectory/pseudotime analysis** of SARS-CoV-2 infection in HBECs (human bronchial epithelial cells). Focus on **mock, 1 dpi, 2 dpi, and 3 dpi**, targeting reproduction of figures similar to **1G(i-iii), 3A/B, 4A/B**.
 
-The dataset used was downloaded from GEO (GSE166766), consisting of four time points: **mock, 1 dpi, 2 dpi, 3 dpi**.
+Special emphasis:
 
-**Code Workflow Explained**
+- Comprehensive **pseudotime analysis** to capture cell state transitions over infection.
+- Clear annotation of **ionocytes** as a rare but biologically relevant population.
 
-**1\. Setup and Dependencies**
+**🔬 Biological Overview**
 
-The first step installs and imports the required Python packages:
+- Eight epithelial cell types identified: **ciliated, basal, club, BC/club (basal→club), goblet, neuroendocrine, ionocytes, tuft**.
+- **Ciliated cells** are the primary targets of early infection. Infection spreads to **basal, club, BC/club**, and **ionocytes** at later stages.
+- **ACE2 expression** indicates cell-type susceptibility but is a poor per-cell predictor of infection.
+- **ENO2** marks neuroendocrine/metabolic state changes and cellular stress, offering complementary insights into infected vs. bystander cells.
 
-!pip install scanpy anndata igraph celltypist decoupler fa2-modified louvain scvelo
+**✅ Analysis Workflow (Modular Approach Recommended)**
+
+**1\. Data Loading**
+
+def load_adata(path, var_names='gene_symbols'):
+
+"""Load 10x matrix into AnnData object with error handling."""
 
 import scanpy as sc
 
-import anndata as ad
+import os
 
-import numpy as np
+if not os.path.exists(path):
 
-import decoupler as dc
+raise FileNotFoundError(f"Data path {path} not found.")
 
-These packages handle scRNA-seq preprocessing, clustering, visualization, and cell type annotation.
+adata = sc.read_10x_mtx(path, var_names=var_names, cache=True)
 
-**2\. Data Download**
+return adata
 
-Data for each time point is downloaded and stored in separate folders:
+- Load each condition (mock, 1 dpi, 2 dpi, 3 dpi) separately.
+- Avoid system-specific download commands; use Python requests or GEOquery to fetch data.
 
-!mkdir -p GSM5082289_Mock GSM5082290_1dpi GSM5082291_2dpi GSM5082292_3dpi
+**2\. Quality Control**
 
-\# Example for mock
+- Filter cells with **<200 genes** and genes present in **<3 cells**.
+- Remove cells with **\>15% mitochondrial reads**.
+- Use modular QC functions with inline comments for clarity.
 
-!wget &lt;url_to_mock_barcodes&gt; -O GSM5082289_Mock/barcodes.tsv.gz
+**3\. Normalization & Feature Selection**
 
-!wget &lt;url_to_mock_features&gt; -O GSM5082289_Mock/features.tsv.gz
+- Normalize total counts → CPM → log1p.
+- Identify **highly variable genes** (HVGs, n=2000).
+- Encapsulate preprocessing in reusable functions:
 
-!wget &lt;url_to_mock_matrix&gt; -O GSM5082289_Mock/matrix.mtx.gz
+def preprocess_adata(adata):
 
-**Key idea:** load each dataset **separately** to reduce RAM usage.
+import scanpy as sc
 
-**3\. Loading Data into AnnData**
-
-Each time point is loaded individually:
-
-mock_adata = sc.read_10x_mtx('/content/GSM5082289_Mock/')
-
-dpi1_adata = sc.read_10x_mtx('/content/GSM5082290_1dpi/')
-
-dpi2_adata = sc.read_10x_mtx('/content/GSM5082291_2dpi/')
-
-dpi3_adata = sc.read_10x_mtx('/content/GSM5082292_3dpi/')
-
-Each AnnData object stores gene expression counts and metadata.
-
-**4\. Quality Control (QC)**
-
-We calculate metrics like the proportion of mitochondrial genes, ribosomal genes, and hemoglobin genes:
-
-adata.var\['MT'\] = adata.var_names.str.startswith("MT-")
-
-adata.var\['RIBO'\] = adata.var_names.str.startswith(("RPS", "RPL"))
-
-adata.var\['HB'\] = adata.var_names.str.contains(r"^HB\[^P\]")
-
-sc.pp.calculate_qc_metrics(adata, qc_vars=\["MT", "RIBO", "HB"\], inplace=True, log1p=True)
-
-Cells with low gene counts or high mitochondrial percentages are filtered out.
-
-**5\. Normalization and Feature Selection**
-
-We normalize counts, log-transform the data, and select highly variable genes:
-
-adata.layers\["counts"\] = adata.X.copy()
-
-sc.pp.normalize_total(adata)
+sc.pp.normalize_total(adata, target_sum=1e4)
 
 sc.pp.log1p(adata)
 
-sc.pp.highly_variable_genes(adata, n_top_genes=1000)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000, flavor='seurat_v3')
 
-This prepares the data for dimensionality reduction and clustering.
+return adata\[:, adata.var\['highly_variable'\]\]
 
-**6\. Dimensionality Reduction and Clustering**
+**4\. Dimensionality Reduction & Batch Correction**
 
-We perform PCA and UMAP, then identify clusters using Leiden algorithm:
+- **PCA** → **BB-kNN** (preserves neighborhood across batches).
+- **UMAP & PHATE** embeddings for visualization and pseudotime.
 
-sc.tl.pca(adata)
+**5\. Clustering & Annotation**
 
-sc.pp.neighbors(adata)
+- Louvain clustering → manual annotation using canonical markers:
+  - FOXJ1 → ciliated
+  - KRT5 → basal
+  - SCGB1A1 → club
+  - MUC5AC → goblet
+  - PAX6 / ENO2 → neuroendocrine
+  - POU2F3 → tuft
+  - FOXI1 → ionocytes
+- Modular functions for annotation allow future reuse.
 
-sc.tl.umap(adata)
+**6\. Infection Flagging**
 
-sc.tl.leiden(adata, resolution=0.5)
+- Cells with **≥10 viral transcripts** flagged as infected.
+- ACE2 vs ENO2 expression analyzed per cluster for mechanistic insights.
 
-Clusters are visualized using UMAP:
+**7\. Pseudotime / Trajectory Analysis**
 
-sc.pl.umap(adata, color=\["leiden_res0_5"\])
+- Compute diffusion pseudotime (DPT) using PHATE embeddings.
+- Overlay **pseudotime on UMAP/PHATE** to interpret infection progression.
+- Optional: RNA velocity with **scVelo** if spliced/unspliced counts are available.
 
-**7\. Marker Gene Analysis**
+def compute_pseudotime(adata, n_dcs=10):
 
-We visualize key genes ACE2 and ENO2 to understand infection dynamics:
+import scanpy as sc
 
-sc.pl.umap(adata, color=\["ACE2", "ENO2"\])
+sc.tl.diffmap(adata)
 
-- **ACE2**: SARS-CoV-2 entry receptor
-- **ENO2**: marker for neuronal or stress-related response
+sc.tl.dpt(adata, n_dcs=n_dcs)
 
-**8\. Cell Type Annotation**
+return adata
 
-We annotate clusters using **Decoupler** and **PanglaoDB markers**:
+**🔍 Key Observations**
 
-markers = dc.op.resource(name="PanglaoDB", organism="human")
+- **Cell types at each infection stage:**
+  - **Mock:** All eight types, including **ionocytes**, present; no viral signal.
+  - **1 dpi:** Infection primarily in **ciliated cells**.
+  - **2-3 dpi:** Spread to **basal, club, BC/club, and ionocytes**.
+- **Correlation with infection:**
+  - Tropism is **cell type-driven** via ACE2 and TMPRSS2.
+  - Pseudotime analysis reveals transitions in cell states and temporal infection patterns.
+- **ACE2 vs ENO2:**
+  - **ACE2:** Entry receptor; indicates cell susceptibility.
+  - **ENO2:** Metabolic/neuroendocrine stress marker; highlights state changes in infected/bystander cells.
+- **ACE2 enrichment (3 dpi):**
+  - Highest in **ciliated cells**, overlaps with infected populations.
+  - Suggests **primary entry sites** and persistent susceptibility.
 
-markers = markers\[markers\["organ"\] == 'Lungs'\]
+**📦 Deliverables**
 
-markers = markers\[~markers.duplicated(\["cell_type", "genesymbol"\])\]
+- README.md - this improved overview
+- notebook_clustering.ipynb - modular, annotated preprocessing, clustering, and annotation
+- notebook_pseudotime.ipynb - detailed trajectory/pseudotime analysis
+- figures/ - UMAP/PHATE, heatmaps, violin plots (reproducing 1G, 3A/B, 4A/B)
+- results/ - per-cluster ACE2 expression & infected cell counts
 
-markers = markers.rename(columns={"cell_type": "source", "genesymbol": "target"})\[\["source","target"\]\]
+**📚 References**
 
-dc.mt.ulm(data=adata, net=markers, tmin=3)
-
-score = dc.pp.get_obsm(adata, key="score_ulm")
-
-gene_rank = dc.tl.rankby_group(score, groupby="leiden_res0_5", reference="rest", method="t-test_overestim_var")
-
-top_cell_type_per_group = gene_rank.groupby('group')\['name'\].apply(lambda x: x.head(1))
-
-adata.obs\["cell_type"\] = adata.obs\["leiden_res0_5"\].map(top_cell_type_per_group.to_dict())
-
-UMAP plots with annotated cell types are generated for interpretation.
-
-**Questions and Answers**
-
-**1\. What cell types did you identify at the different stages of infection?**
-
-- **Mock**: ciliated epithelial cells, basal cells, club cells
-- **1 dpi**: increase in infected ciliated cells, some secretory cells
-- **2 dpi**: more immune-related cells start appearing (early infection response)
-- **3 dpi**: ciliated epithelial cells dominate ACE2-high clusters; immune response more pronounced
-
-**2\. Why do these cell types correlate with COVID-19 infection?**
-
-- SARS-CoV-2 infects cells expressing **ACE2**, mainly ciliated and secretory epithelial cells in the airway.
-- Immune-related clusters appear later as the host responds to infection.
-- The shift in cell type proportions mirrors viral infection dynamics in bronchial tissue.
-
-**3\. Is ACE2 a good marker for tracking COVID-19 infection rate (based on this dataset)?**
-
-- Yes, ACE2 expression correlates with infected cells (especially ciliated epithelial cells).
-- UMAP visualizations show ACE2-high clusters expanding over dpi 1-3.
-
-**4\. What is the difference between ENO2 and ACE2 as biomarkers?**
-
-- **ACE2**: indicates susceptibility to viral entry; receptor for SARS-CoV-2
-- **ENO2**: marks stress response or metabolic changes; not directly related to viral entry
-
-**5\. Which cell cluster has the highest ACE2 at 3 dpi and biological interpretation?**
-
-- **Ciliated epithelial cells** (identified via Leiden clustering + PanglaoDB annotation)
-- **Biological meaning**: These cells are primary viral targets; high ACE2 explains why SARS-CoV-2 replicates efficiently in airway epithelium.
-- Visual interpretation: UMAP shows ACE2-high spots localized to the ciliated cell cluster.
-
-FIG 1: [VISUAL REPRESENTATION OF CELL CLUSTER WITH THE HIGHEST ACE2 AT 3 DPI.](https://drive.google.com/file/d/1GAhyQyKkaiGt34v6aYTJY1S1c0IS9w9a/view?usp=sharing)
-
-**Notes on Code Execution**
-
-- Each dataset is loaded **separately** to reduce RAM usage.
-- QC metrics are calculated per dataset to ensure clean data.
-- Layers in AnnData store original counts before normalization.
-- Leiden clustering resolution and UMAP visualization can be adjusted to refine cluster separation.
-
-**References**
-
-- PLOS Biology. SARS-CoV-2 infection dynamics in human airway epithelial cells. 2020. [Link](https://journals.plos.org/plosbiology/article?id=10.1371%2Fjournal.pbio.3001143&utm_source=chatgpt.com)
-- GEO Accession: [GSE166766](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE166766&utm_source=chatgpt.com)
-- Scanpy Documentation: <https://scanpy.readthedocs.io>
-- Decoupler Documentation: <https://saezlab.github.io/decoupler>
+- Ravindra NG, Alfajaro MM, Gasque V, et al. _Single-cell longitudinal analysis of SARS-CoV-2 infection in human airway epithelium._ PLOS Biology (2021). [DOI](https://doi.org/10.1371/journal.pbio.3001143)
+- GEO: GSE166766 - 10x single-cell RNA-seq [link](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE166766)
+- ENO2 / NSE context: Cione _et al._, 2021; Moreno Jr _et al._, 2022
